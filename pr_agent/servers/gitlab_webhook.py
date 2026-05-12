@@ -108,6 +108,43 @@ def is_draft_ready(data) -> bool:
         get_logger().error(f"Failed 'is_draft_ready' logic: {e}")
     return False
 
+_bot_user_id_cache = None
+
+def _get_bot_user_id():
+    global _bot_user_id_cache
+    if _bot_user_id_cache is not None:
+        return _bot_user_id_cache
+    try:
+        import gitlab
+        gl = gitlab.Gitlab(
+            get_settings().get("GITLAB.URL", "https://gitlab.com"),
+            private_token=get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN", None),
+        )
+        gl.auth()
+        _bot_user_id_cache = gl.user.id
+        get_logger().info(f"Bot user ID resolved via API: {_bot_user_id_cache}")
+        return _bot_user_id_cache
+    except Exception as e:
+        get_logger().error(f"Failed to resolve bot user ID: {e}")
+        return None
+
+def is_bot_assigned_as_reviewer(data) -> bool:
+    try:
+        if 'reviewers' not in data.get('changes', {}):
+            return False
+        reviewers_change = data['changes']['reviewers']
+        previous = reviewers_change.get('previous', [])
+        current = reviewers_change.get('current', [])
+        bot_user_id = _get_bot_user_id()
+        if bot_user_id is None:
+            return False
+        previous_ids = {r.get('id') for r in previous} if isinstance(previous, list) else set()
+        current_ids = {r.get('id') for r in current} if isinstance(current, list) else set()
+        return bot_user_id in current_ids and bot_user_id not in previous_ids
+    except Exception as e:
+        get_logger().error(f"Failed 'is_bot_assigned_as_reviewer' logic: {e}")
+    return False
+
 def should_process_pr_logic(data) -> bool:
     try:
         if not data.get('object_attributes', {}):
@@ -255,6 +292,14 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
 
                 # same as open MR
                 await _perform_commands_gitlab("pr_commands", PRAgent(), url, log_context, data)
+
+            # for reviewer assignment triggered merge requests
+            elif object_attributes.get('action') == 'update' and is_bot_assigned_as_reviewer(data):
+                url = object_attributes.get('url')
+                apply_repo_settings(url)
+                if get_settings().gitlab.get('handle_reviewer_assignment', False):
+                    get_logger().info(f"Bot was assigned as reviewer on MR: {url}")
+                    await _perform_commands_gitlab("reviewer_commands", PRAgent(), url, log_context, data)
 
         elif data.get('object_kind') == 'note' and data.get('event_type') == 'note': # comment on MR
             if 'merge_request' in data:
